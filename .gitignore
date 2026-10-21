@@ -1,0 +1,31 @@
+# build output
+build/
+build-*/
+.gradle/
+.cxx/
+app/build/
+*.apk
+*.aab
+# test fixtures are real (and deliberately broken) APK archives that the tests need
+!core/tests/fixtures/*.apk
+local.properties
+dist/
+
+# signing material must never be committed
+*.jks
+*.keystore
+keystore.properties
+
+# third-party sources are restored by scripts/fetch_third_party.sh at the pinned commits
+third_party/zlib/
+third_party/zstd/
+third_party/capstone/
+third_party/ELFIO/
+third_party/LIEF/
+third_party/unicorn/
+
+# local logs and editor files
+clone_*.log
+.idea/
+*.iml
+.DS_Store

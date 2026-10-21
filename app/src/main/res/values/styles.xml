@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Kratos" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/kratos_bg</item>
+        <item name="android:statusBarColor">@color/kratos_bg</item>
+        <item name="android:navigationBarColor">@color/kratos_bg</item>
+        <item name="android:colorAccent">@color/kratos_accent</item>
+        <item name="android:colorBackground">@color/kratos_bg</item>
+        <item name="android:textColorPrimary">@color/kratos_text</item>
+        <item name="android:textColorSecondary">@color/kratos_muted</item>
+        <item name="android:alertDialogTheme">@style/Theme.Kratos.Dialog</item>
+    </style>
+
+    <style name="Theme.Kratos.Dialog" parent="android:Theme.Material.Dialog.Alert">
+        <item name="android:colorBackground">@color/kratos_panel</item>
+        <item name="android:textColorPrimary">@color/kratos_text</item>
+        <item name="android:textColorSecondary">@color/kratos_muted</item>
+        <item name="android:colorAccent">@color/kratos_accent</item>
+    </style>
+</resources>

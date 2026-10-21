@@ -1,0 +1,175 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: "27.2.12479018"
+  CMAKE_VERSION: "3.22.1"
+  BUILD_TOOLS_VERSION: "34.0.0"
+  PLATFORM: "android-34"
+
+jobs:
+  # Host build of the analysis core, the test suite, the JNI bridge test in a real JVM, and the same suite under AddressSanitizer.
+  core-tests:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [release, sanitize]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned third-party sources
+        run: scripts/fetch_third_party.sh
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build cmake g++ python3 default-jdk-headless
+
+      - name: Configure and build
+        run: |
+          if [ "${{ matrix.mode }}" = "sanitize" ]; then
+            FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+            cmake -S core -B build/core -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+              -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          else
+            cmake -S core -B build/core -G Ninja -DCMAKE_BUILD_TYPE=Release
+          fi
+          cmake --build build/core
+
+      - name: Run tests
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build/core --output-on-failure
+
+      - name: JNI bridge test in a JVM
+        if: matrix.mode == 'release'
+        run: core/tests/jni/run_jni_test.sh "$PWD/build/jni"
+
+  # Android APKs: arm64-v8a, armeabi-v7a and universal.
+  android:
+    needs: core-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned third-party sources
+        run: scripts/fetch_third_party.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK components
+        run: |
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"; fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" "platforms;$PLATFORM" "build-tools;$BUILD_TOOLS_VERSION"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The keystore comes only from GitHub Secrets. When the secrets are missing (for example in pull requests from forks),
+      # the build is signed with the debug key and every artifact is named accordingly.
+      - name: Prepare release keystore
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KRATOS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KRATOS_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KRATOS_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KRATOS_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/kratos-release.jks"
+            echo "path=$RUNNER_TEMP/kratos-release.jks" >> "$GITHUB_OUTPUT"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Release signing secrets are not set. The APKs are signed with the debug key and are not suitable for distribution."
+          fi
+
+      - name: Build APKs
+        env:
+          KRATOS_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          KRATOS_KEYSTORE_PASSWORD: ${{ secrets.KRATOS_KEYSTORE_PASSWORD }}
+          KRATOS_KEY_ALIAS: ${{ secrets.KRATOS_KEY_ALIAS }}
+          KRATOS_KEY_PASSWORD: ${{ secrets.KRATOS_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Verify signatures and collect APKs
+        id: collect
+        env:
+          SIGNED: ${{ steps.keystore.outputs.signed }}
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          SUFFIX=""
+          if [ "$SIGNED" != "true" ]; then SUFFIX="-DEBUG-SIGNED"; fi
+          mkdir -p dist
+          : > dist/SUMMARY.md
+          {
+            echo "| file | size | sha256 | v1 | v2 | v3 |"
+            echo "|---|---|---|---|---|---|"
+          } >> dist/SUMMARY.md
+          found=0
+          for abi in arm64-v8a armeabi-v7a universal; do
+            src="app/build/outputs/apk/release/app-$abi-release.apk"
+            if [ ! -f "$src" ]; then
+              echo "::error::missing $src"
+              exit 1
+            fi
+            found=$((found + 1))
+            dst="dist/kratos-dump-$abi$SUFFIX.apk"
+            cp "$src" "$dst"
+            report="$("$APKSIGNER" verify --verbose --print-certs "$dst")"
+            echo "$report"
+            v1="$(echo "$report" | grep -c 'Verified using v1 scheme (JAR signing): true' || true)"
+            v2="$(echo "$report" | grep -c 'Verified using v2 scheme (APK Signature Scheme v2): true' || true)"
+            v3="$(echo "$report" | grep -c 'Verified using v3 scheme (APK Signature Scheme v3): true' || true)"
+            if [ "$SIGNED" = "true" ] && { [ "$v1" != "1" ] || [ "$v2" != "1" ] || [ "$v3" != "1" ]; }; then
+              echo "::error::$dst is not signed with all of V1, V2 and V3"
+              exit 1
+            fi
+            size="$(stat -c %s "$dst")"
+            sum="$(sha256sum "$dst" | cut -d' ' -f1)"
+            echo "| $(basename "$dst") | $size | $sum | $v1 | $v2 | $v3 |" >> dist/SUMMARY.md
+          done
+          {
+            echo
+            if [ "$SIGNED" = "true" ]; then
+              echo "Signed with the release key from GitHub Secrets."
+            else
+              echo "**Signed with the debug key** because the release secrets are not set."
+            fi
+            echo
+            echo "These files were built by this workflow. They were not installed or run on a device."
+          } >> dist/SUMMARY.md
+          cat dist/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.keystore.outputs.signed == 'true' && 'kratos-dump-apk' || 'kratos-dump-apk-debug-signed' }}
+          path: |
+            dist/*.apk
+            dist/SUMMARY.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kratos-release.jks"
